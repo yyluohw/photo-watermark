@@ -99,9 +99,7 @@ def add_watermark(input_path, output_path, config):
     # 斜体：对 text_layer 做轻微的斜切以模拟斜体效果
     if config.get('italic'):
         try:
-            shear = 0.25
-            # 使用正向水平切变以实现左斜体效果
-            text_layer = text_layer.transform(text_layer.size, Image.AFFINE, (1, shear, 0, 0, 1, 0), resample=Image.BICUBIC)
+            text_layer = apply_italic_shear(text_layer)
         except Exception:
             pass
 
@@ -137,13 +135,12 @@ def add_watermark(input_path, output_path, config):
     return True
 
 def load_font(size, custom_path=None, italic=False):
-    """加载字体，优先尝试斜体变体，失败则回退到常规字体或默认字体"""
+    """加载字体，优先使用真正的斜体字形；若没有可用斜体字体，则退回到轻微仿真效果。"""
     font_paths = []
 
     if custom_path and os.path.exists(custom_path):
         font_paths.append(custom_path)
 
-    # 系统默认字体
     font_paths.extend([
         "/System/Library/Fonts/PingFang.ttc",  # macOS
         "/System/Library/Fonts/STHeiti Light.ttc",
@@ -154,53 +151,77 @@ def load_font(size, custom_path=None, italic=False):
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
     ])
 
-    def try_load(path):
+    def try_load(path, index=None):
         try:
-            return ImageFont.truetype(path, size)
+            return ImageFont.truetype(path, size, index=index) if index is not None else ImageFont.truetype(path, size)
         except Exception:
             return None
 
-    # If italic requested, try to find italic/oblique variants nearby
+    def try_candidates(paths):
+        for path in paths:
+            if italic:
+                for idx in (1, 2, 3):
+                    f = try_load(path, index=idx)
+                    if f:
+                        return f
+            f = try_load(path)
+            if f:
+                return f
+        return None
+
     if italic:
-        # check directory of custom path first
         if custom_path and os.path.exists(custom_path):
             d = os.path.dirname(custom_path)
             try:
                 for fname in os.listdir(d):
-                    if 'italic' in fname.lower() or 'oblique' in fname.lower():
-                        found = try_load(os.path.join(d, fname))
+                    if 'italic' in fname.lower() or 'oblique' in fname.lower() or 'slanted' in fname.lower():
+                        found = try_candidates([os.path.join(d, fname)])
                         if found:
                             return found
             except Exception:
                 pass
 
-        # check common font paths for italic names or variants
         for path in font_paths:
-            # try obvious filename variants
             base, ext = os.path.splitext(path)
             for cand in (base + ' Italic' + ext, base + '-Italic' + ext, base + 'Italic' + ext):
                 if os.path.exists(cand):
-                    f = try_load(cand)
+                    f = try_candidates([cand])
                     if f:
                         return f
-            # scan sibling files in same dir for 'italic' or 'oblique'
             d = os.path.dirname(path)
             try:
                 for fname in os.listdir(d):
-                    if 'italic' in fname.lower() or 'oblique' in fname.lower():
-                        found = try_load(os.path.join(d, fname))
+                    if 'italic' in fname.lower() or 'oblique' in fname.lower() or 'slanted' in fname.lower():
+                        found = try_candidates([os.path.join(d, fname)])
                         if found:
                             return found
             except Exception:
                 continue
 
-    # fallback: try to load regular fonts
-    for path in font_paths:
-        f = try_load(path)
-        if f:
-            return f
+    font = try_candidates(font_paths)
+    if font:
+        return font
 
     return ImageFont.load_default()
+
+
+def apply_italic_shear(layer, shear=0.15):
+    """仅在找不到真实斜体字形时使用的轻微仿真效果，不再做反向平移补偿。"""
+    try:
+        width, height = layer.size
+        offset = max(2, int(abs(shear) * height * 1.2))
+        transformed = layer.transform(
+            (width + offset, height),
+            Image.AFFINE,
+            (1, shear, 0, 0, 1, 0),
+            resample=Image.BICUBIC,
+            fillcolor=(0, 0, 0, 0),
+        )
+        canvas = Image.new('RGBA', (width + offset, height), (0, 0, 0, 0))
+        canvas.paste(transformed, (0, 0), transformed)
+        return canvas.crop((0, 0, width, height))
+    except Exception:
+        return layer
 
 # ============ GUI 界面 ============
 
@@ -482,11 +503,17 @@ class WatermarkApp:
             return
         self.preview_window = tk.Toplevel(self.root)
         self.preview_window.title("水印实时预览")
-        self.preview_window.geometry("640x480")
+        # 默认与主窗口大小一致
+        width = self.root.winfo_width() or 700
+        height = self.root.winfo_height() or 640
+        self.preview_window.geometry(f"{width}x{height}")
         self.preview_window.minsize(360, 240)
-        self.preview_label = ttk.Label(self.preview_window)
+        self.preview_window.resizable(True, True)
+        self.preview_label = ttk.Label(self.preview_window, anchor='center')
         self.preview_label.pack(fill='both', expand=True)
         self.preview_window.protocol('WM_DELETE_WINDOW', self.on_preview_window_close)
+        self.preview_window.bind('<Configure>', self.on_preview_window_resize)
+        self.preview_resize_after_id = None
 
     def on_preview_window_close(self):
         if self.preview_window:
@@ -496,6 +523,15 @@ class WatermarkApp:
                 pass
         self.preview_window = None
         self.preview_label = None
+        self.preview_resize_after_id = None
+
+    def on_preview_window_resize(self, event):
+        # 仅在实际大小变化时重新渲染预览，避免频繁刷新
+        if event.widget is self.preview_window:
+            if self.preview_image_path and self.preview_window and self.preview_window.winfo_exists():
+                if self.preview_resize_after_id:
+                    self.preview_window.after_cancel(self.preview_resize_after_id)
+                self.preview_resize_after_id = self.preview_window.after(120, self.render_preview)
 
     def on_preview_change(self, *args):
         if self.preview_image_path and self.preview_window and self.preview_window.winfo_exists():
@@ -503,17 +539,9 @@ class WatermarkApp:
 
     def render_preview(self):
         try:
-            # 读取示例图并在内存中绘制缩略水印
             sample = Image.open(self.preview_image_path)
             sample = ImageOps.exif_transpose(sample)
-            # 缩放到最大宽度 600 px 以便预览
-            max_w = 600
-            w, h = sample.size
-            if w > max_w:
-                ratio = max_w / w
-                sample = sample.resize((int(w * ratio), int(h * ratio)), Image.LANCZOS)
 
-            # 组装配置（与 start_process 相同的映射）
             size_map = {'超小': 1.5, '小': 2.5, '中': 3.5, '大': 5}
             font_scale_pct = size_map.get(self.scale_var.get(), 3.5)
             config = {
@@ -529,7 +557,6 @@ class WatermarkApp:
                 'font_path': None,
             }
 
-            # 在临时路径上调用 add_watermark 的逻辑 but without saving file — reproduce drawing steps
             img = sample.convert('RGBA')
             width, height = img.size
 
@@ -537,7 +564,6 @@ class WatermarkApp:
             if date_taken:
                 date_str = date_taken.strftime(config['date_format'])
             else:
-                import time
                 date_str = datetime.fromtimestamp(os.path.getmtime(self.preview_image_path)).strftime(config['date_format'])
 
             font_size = max(10, int(height * (config['font_scale'] / 100)))
@@ -590,14 +616,24 @@ class WatermarkApp:
 
             if config.get('italic'):
                 try:
-                    shear = 0.25
-                    text_layer = text_layer.transform(text_layer.size, Image.AFFINE, (1, shear, 0, 0, 1, 0), resample=Image.BICUBIC)
+                    text_layer = apply_italic_shear(text_layer)
                 except Exception:
                     pass
 
             preview_img = Image.alpha_composite(img, text_layer).convert('RGB')
 
-            # convert to ImageTk for display
+            # 根据预览窗口大小调整显示，但不放大超出原始图片尺寸
+            if self.preview_window and self.preview_window.winfo_exists() and self.preview_label:
+                label_w = self.preview_label.winfo_width() or self.preview_window.winfo_width()
+                label_h = self.preview_label.winfo_height() or self.preview_window.winfo_height()
+                # 减去少量边距，避免显示边界被遮挡
+                label_w = max(1, label_w - 10)
+                label_h = max(1, label_h - 10)
+                scale = min(1.0, label_w / preview_img.width, label_h / preview_img.height)
+                if scale < 1.0:
+                    new_size = (max(1, int(preview_img.width * scale)), max(1, int(preview_img.height * scale)))
+                    preview_img = preview_img.resize(new_size, Image.LANCZOS)
+
             tkimg = ImageTk.PhotoImage(preview_img)
             self.preview_label.configure(image=tkimg)
             self.preview_label.image = tkimg

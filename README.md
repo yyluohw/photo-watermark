@@ -34,17 +34,44 @@
 pip install pillow
 ```
 
-2. 启动图形界面：
+如果需要处理 HEIC/HEIF 图片，还请安装：
+
+```bash
+pip install pillow_heif
+```
+
+2. 运行 Python 文件：
+
+- 运行图形界面：
 
 ```bash
 python watermark_gui.py
 ```
 
-3. 批量处理（脚本方式）：
+- 运行脚本批量处理（直接执行 `watermark.py`，或在其他脚本中导入）：
+
+```bash
+python watermark.py
+```
+
+运行 `python watermark.py` 时，程序会打开 GUI 让你选择输入/输出文件夹；如果你希望不使用 GUI，请在另一个 Python 脚本中导入并调用 `batch_process`：
 
 ```python
 from watermark import batch_process
 batch_process(r"path\to\photoInput", r"path\to\photoOutput")
+```
+
+3. 示例：
+
+```bash
+python watermark_gui.py
+```
+
+或在 Python 脚本中：
+
+```python
+from watermark import batch_process
+batch_process(r"e:\photo-watermark\photoInput", r"e:\photo-watermark\photoOutput")
 ```
 
 ## 目录结构
