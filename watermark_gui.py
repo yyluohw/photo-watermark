@@ -1,9 +1,18 @@
+import calendar
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, colorchooser
 from PIL import Image, ImageDraw, ImageFont, ExifTags, ImageOps, ImageTk
 import os
 from datetime import datetime
 import threading
+
+WATERMARK_TYPES = ["LOCATION", "DATE", "PREGNANCY", "AGE"]
+WATERMARK_TYPE_LABELS = {
+    "DATE": "日期",
+    "LOCATION": "位置",
+    "PREGNANCY": "怀孕",
+    "AGE": "年龄",
+}
 
 # ============ HEIC 支持（可选） ============
 try:
@@ -28,59 +37,179 @@ def get_date_taken(image_path):
         pass
     return None
 
+
+def _convert_to_degrees(value):
+    try:
+        d = value[0][0] / value[0][1]
+        m = value[1][0] / value[1][1]
+        s = value[2][0] / value[2][1]
+        return d + m / 60 + s / 3600
+    except Exception:
+        return None
+
+
+def get_exif_location(image_path):
+    try:
+        image = Image.open(image_path)
+        exif = image._getexif()
+        if not exif:
+            return None
+        gps_tag = next((tag_id for tag_id, tag_name in ExifTags.TAGS.items() if tag_name == 'GPSInfo'), None)
+        if gps_tag is None or gps_tag not in exif:
+            return None
+        gps_info = exif[gps_tag]
+        gps = {}
+        for key, value in gps_info.items():
+            name = ExifTags.GPSTAGS.get(key, key)
+            gps[name] = value
+        lat = _convert_to_degrees(gps.get('GPSLatitude'))
+        lon = _convert_to_degrees(gps.get('GPSLongitude'))
+        lat_ref = gps.get('GPSLatitudeRef')
+        lon_ref = gps.get('GPSLongitudeRef')
+        if lat is None or lon is None or not lat_ref or not lon_ref:
+            return None
+        if lat_ref.upper() == 'S':
+            lat = -lat
+        if lon_ref.upper() == 'W':
+            lon = -lon
+        return lat, lon
+    except Exception:
+        return None
+
+
+def format_location_text(image_path, default_value):
+    gps = get_exif_location(image_path)
+    if gps:
+        lat, lon = gps
+        lat_dir = 'N' if lat >= 0 else 'S'
+        lon_dir = 'E' if lon >= 0 else 'W'
+        return f"{abs(lat):.5f}°{lat_dir} {abs(lon):.5f}°{lon_dir}"
+    return default_value.strip() if default_value and default_value.strip() else None
+
+
+def parse_date_input(date_text):
+    if not date_text:
+        return None
+    for fmt in ["%Y-%m-%d", "%Y/%m/%d", "%Y.%m.%d"]:
+        try:
+            return datetime.strptime(date_text.strip(), fmt)
+        except Exception:
+            continue
+    return None
+
+
+def calc_pregnancy_text(photo_date, due_date_text):
+    due_date = parse_date_input(due_date_text)
+    if not due_date:
+        return None
+    days_before_due = (due_date - photo_date).days
+    days_pregnant = 280 - days_before_due
+    if days_pregnant < 0 or days_pregnant > 280:
+        return None
+    weeks = days_pregnant // 7
+    days = days_pregnant % 7
+    return f"孕{weeks}周+{days}天"
+
+
+def calc_age_text(photo_date, birth_date_text):
+    birth_date = parse_date_input(birth_date_text)
+    if not birth_date or photo_date < birth_date:
+        return None
+    year_diff = photo_date.year - birth_date.year
+    month_diff = photo_date.month - birth_date.month
+    day_diff = photo_date.day - birth_date.day
+    if day_diff < 0:
+        month_diff -= 1
+    total_months = year_diff * 12 + month_diff
+    if total_months < 0:
+        return None
+    if total_months >= 12:
+        years = total_months // 12
+        months = total_months % 12
+        return f"{years}岁{months}月" if months else f"{years}岁"
+    return f"{total_months}月"
+
+
+def build_watermark_lines(image_path, config, preview=False):
+    photo_date = get_date_taken(image_path)
+    if not photo_date:
+        photo_date = datetime.fromtimestamp(os.path.getmtime(image_path))
+    lines = []
+    for wt in config.get('watermark_types', ['DATE']):
+        if wt == 'LOCATION':
+            loc_text = format_location_text(image_path, config.get('default_location', ''))
+            if loc_text:
+                lines.append(loc_text)
+            elif preview:
+                lines.append(WATERMARK_TYPE_LABELS.get('LOCATION', '位置'))
+        elif wt == 'DATE':
+            lines.append(photo_date.strftime(config.get('date_format', '%Y-%m-%d %H:%M')))
+        elif wt == 'PREGNANCY':
+            preg = calc_pregnancy_text(photo_date, config.get('due_date', ''))
+            if preg:
+                lines.append(preg)
+            elif preview:
+                lines.append(WATERMARK_TYPE_LABELS.get('PREGNANCY', '怀孕'))
+        elif wt == 'AGE':
+            age = calc_age_text(photo_date, config.get('birth_date', ''))
+            if age:
+                lines.append(age)
+            elif preview:
+                lines.append(WATERMARK_TYPE_LABELS.get('AGE', '年龄'))
+    return lines
+
+
 def add_watermark(input_path, output_path, config):
     original = Image.open(input_path)
     img = ImageOps.exif_transpose(original.copy())
     width, height = img.size
 
-    # 获取日期
-    date_taken = get_date_taken(input_path)
-    if date_taken:
-        date_str = date_taken.strftime(config['date_format'])
-    else:
-        mtime = os.path.getmtime(input_path)
-        date_str = datetime.fromtimestamp(mtime).strftime(config['date_format'])
+    lines = build_watermark_lines(input_path, config)
+    if not lines:
+        date_taken = get_date_taken(input_path)
+        if date_taken:
+            lines = [date_taken.strftime(config['date_format'])]
+        else:
+            mtime = os.path.getmtime(input_path)
+            lines = [datetime.fromtimestamp(mtime).strftime(config['date_format'])]
 
     # 动态字体大小（使用较小比例）
     font_size = max(10, int(height * (config['font_scale'] / 100)))
     font = load_font(font_size, config.get('font_path'), italic=config.get('italic'))
 
-    # 计算文字尺寸并确保文字宽度不超出图片范围
-    text_layer = Image.new('RGBA', (1, 1), (0, 0, 0, 0))
-    text_draw = ImageDraw.Draw(text_layer)
-    bbox = text_draw.textbbox((0, 0), date_str, font=font)
-    text_width = bbox[2] - bbox[0]
-    text_height = bbox[3] - bbox[1]
-
-    italic_extra = int(abs(0.15) * text_height) if config.get('italic') else 0
-    padding = 4
-
-    margin = max(4, int(font_size * 0.6))
-    max_text_width = width - 2 * margin
-    while text_width + italic_extra + padding * 2 > max_text_width and font_size > 10:
-        font_size -= 1
-        font = load_font(font_size, config.get('font_path'), italic=config.get('italic'))
-        text_layer = Image.new('RGBA', (1, 1), (0, 0, 0, 0))
-        text_draw = ImageDraw.Draw(text_layer)
-        bbox = text_draw.textbbox((0, 0), date_str, font=font)
-        text_width = bbox[2] - bbox[0]
-        text_height = bbox[3] - bbox[1]
-        italic_extra = int(abs(0.15) * text_height) if config.get('italic') else 0
-
     r, g, b = config['color']
     opacity = int(config['opacity'])
     alpha = int(255 * (opacity / 100))
+    margin = max(4, int(font_size * 0.6))
     padding = max(6, int(font_size * 0.25))
-    text_layer = build_text_layer(
-        date_str,
-        font,
-        (r, g, b),
-        alpha,
-        outline=config.get('outline'),
-        italic=config.get('italic'),
-        padding=padding,
-    )
-    layer_w, layer_h = text_layer.size
+
+    if config['position'] in ['右下', '右上', 'bottom-right', 'top-right']:
+        align = 'right'
+    elif config['position'] in ['底部居中', 'bottom-center', 'center']:
+        align = 'center'
+    else:
+        align = 'left'
+
+    text = "\n".join(lines)
+    max_text_width = width - 2 * margin
+    while True:
+        text_layer = build_text_layer(
+            text,
+            font,
+            (r, g, b),
+            alpha,
+            outline=config.get('outline'),
+            italic=config.get('italic'),
+            padding=padding,
+            align=align,
+        )
+        layer_w, layer_h = text_layer.size
+        if layer_w <= max_text_width or font_size <= 10:
+            break
+        font_size -= 1
+        font = load_font(font_size, config.get('font_path'), italic=config.get('italic'))
+        padding = max(6, int(font_size * 0.25))
+
     pos = config['position']
     if pos == "右下":
         x = width - layer_w - margin
@@ -186,17 +315,34 @@ def apply_italic_shear(layer, shear=0.15):
         return layer
 
 
-def build_text_layer(text, font, color, alpha, outline=False, italic=False, padding=8):
+def build_text_layer(text, font, color, alpha, outline=False, italic=False, padding=8, align='left'):
     """生成可完整包容文字与描边的 RGBA 文本图层，避免字体基线偏移导致裁剪。"""
+    spacing = max(4, int(font.size * 0.2))
     temp = Image.new('RGBA', (1, 1), (0, 0, 0, 0))
     temp_draw = ImageDraw.Draw(temp)
-    bbox = temp_draw.textbbox((0, 0), text, font=font)
+    try:
+        bbox = temp_draw.multiline_textbbox((0, 0), text, font=font, spacing=spacing, align=align)
+    except AttributeError:
+        lines = text.split('\n')
+        widths = []
+        heights = []
+        for line in lines:
+            if line:
+                line_bbox = temp_draw.textbbox((0, 0), line, font=font)
+                widths.append(line_bbox[2] - line_bbox[0])
+                heights.append(line_bbox[3] - line_bbox[1])
+            else:
+                widths.append(0)
+                heights.append(font.size)
+        text_width = max(widths) if widths else 0
+        text_height = sum(heights) + spacing * (len(lines) - 1)
+        bbox = (0, 0, text_width, text_height)
     text_width = bbox[2] - bbox[0]
     text_height = bbox[3] - bbox[1]
     italic_extra = int(abs(0.15) * text_height) if italic else 0
 
-    layer_w = text_width + italic_extra + padding * 2
-    layer_h = text_height + padding * 2
+    layer_w = int(round(text_width + italic_extra + padding * 2))
+    layer_h = int(round(text_height + padding * 2))
     text_layer = Image.new('RGBA', (layer_w, layer_h), (0, 0, 0, 0))
     text_draw = ImageDraw.Draw(text_layer)
 
@@ -205,9 +351,9 @@ def build_text_layer(text, font, color, alpha, outline=False, italic=False, padd
     if outline:
         outline_color = (0, 0, 0, alpha)
         for dx, dy in [(-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1)]:
-            text_draw.text((draw_x + dx, draw_y + dy), text, font=font, fill=outline_color)
+            text_draw.multiline_text((draw_x + dx, draw_y + dy), text, font=font, fill=outline_color, spacing=spacing, align=align)
 
-    text_draw.text((draw_x, draw_y), text, fill=(color[0], color[1], color[2], alpha), font=font)
+    text_draw.multiline_text((draw_x, draw_y), text, fill=(color[0], color[1], color[2], alpha), font=font, spacing=spacing, align=align)
 
     if italic:
         try:
@@ -238,6 +384,9 @@ class WatermarkApp:
         self.scale_var = tk.StringVar(value="中")
         self.outline_var = tk.BooleanVar(value=True)
         self.italic_var = tk.BooleanVar(value=False)
+        self.default_location_var = tk.StringVar(value="")
+        self.due_date_var = tk.StringVar(value="")
+        self.birth_date_var = tk.StringVar(value="")
         # 保存模式: 'keep' 或 'jpeg'
         self.save_mode_var = tk.StringVar(value='keep')
         self.color = (255, 255, 255)  # 默认白色
@@ -245,6 +394,8 @@ class WatermarkApp:
         self.preview_image_path = None
         self.preview_window = None
         self.preview_label = None
+        self.watermark_type_vars = {}
+        self.watermark_order = WATERMARK_TYPES.copy()
         
         self.create_ui()
         
@@ -306,6 +457,44 @@ class WatermarkApp:
                      values=["%Y-%m-%d %H:%M", "%Y-%m-%d", "%Y/%m/%d", 
                              "%m-%d %H:%M", "%Y年%m月%d日"],
                      width=18, state='readonly').grid(row=3, column=1, sticky='w')
+
+        # 水印类型
+        watermark_frame = ttk.LabelFrame(frame2, text="水印类型", padding=10)
+        watermark_frame.grid(row=4, column=0, columnspan=6, sticky='ew', pady=10)
+
+        cb_frame = ttk.Frame(watermark_frame)
+        cb_frame.grid(row=0, column=0, sticky='nw')
+        for idx, watermark_type in enumerate(WATERMARK_TYPES):
+            var = tk.BooleanVar(value=(watermark_type == "DATE" or watermark_type == "LOCATION"))
+            self.watermark_type_vars[watermark_type] = var
+            cb = ttk.Checkbutton(
+                cb_frame,
+                text=WATERMARK_TYPE_LABELS[watermark_type],
+                variable=var,
+                command=self.on_watermark_type_toggle,
+            )
+            cb.grid(row=idx, column=0, sticky='w', pady=2)
+
+        self.watermark_selected_listbox = tk.Listbox(
+            watermark_frame,
+            height=5,
+            selectmode='none',
+        )
+        self.watermark_selected_listbox.grid(row=0, column=1, sticky='nsew', padx=(10, 0))
+        watermark_frame.grid_columnconfigure(1, weight=1)
+        self.refresh_watermark_type_list()
+
+        # 额外参数
+        extra_frame = ttk.Frame(frame2)
+        extra_frame.grid(row=5, column=0, columnspan=6, sticky='ew', pady=(0, 10))
+        ttk.Label(extra_frame, text="默认位置:").grid(row=0, column=0, sticky='w')
+        ttk.Entry(extra_frame, textvariable=self.default_location_var, width=20).grid(row=0, column=1, sticky='w', padx=(4, 20))
+        ttk.Label(extra_frame, text="预产期:").grid(row=0, column=2, sticky='w')
+        ttk.Entry(extra_frame, textvariable=self.due_date_var, width=12).grid(row=0, column=3, sticky='w')
+        ttk.Button(extra_frame, text="🗓", width=3, command=lambda: self.open_date_picker(self.due_date_var, "选择预产期")).grid(row=0, column=4, sticky='w', padx=(4, 20))
+        ttk.Label(extra_frame, text="出生日期:").grid(row=0, column=5, sticky='w')
+        ttk.Entry(extra_frame, textvariable=self.birth_date_var, width=12).grid(row=0, column=6, sticky='w')
+        ttk.Button(extra_frame, text="🗓", width=3, command=lambda: self.open_date_picker(self.birth_date_var, "选择出生日期")).grid(row=0, column=7, sticky='w', padx=(4, 0))
         
         # 输出质量
         frame3 = ttk.LabelFrame(self.root, text="输出质量", padding=10)
@@ -344,7 +533,10 @@ class WatermarkApp:
         # 监听设置变化，实时更新预览（如果已经选择了示例图）
         for var in (self.position_var, self.format_var, self.quality_var,
                     self.opacity_var, self.scale_var, self.outline_var,
-                    self.italic_var, self.save_mode_var):
+                    self.italic_var, self.save_mode_var,
+                    self.default_location_var, self.due_date_var, self.birth_date_var):
+            var.trace_add('write', self.on_preview_change)
+        for var in self.watermark_type_vars.values():
             var.trace_add('write', self.on_preview_change)
     
     def browse_input(self):
@@ -423,6 +615,21 @@ class WatermarkApp:
         except Exception:
             pass
 
+    def get_selected_watermark_types(self):
+        return [wt for wt in self.watermark_order if self.watermark_type_vars.get(wt, tk.BooleanVar()).get()]
+
+    def get_selected_watermark_type_labels(self):
+        return [WATERMARK_TYPE_LABELS[wt] for wt in self.get_selected_watermark_types()]
+
+    def refresh_watermark_type_list(self):
+        self.watermark_selected_listbox.delete(0, tk.END)
+        for wt in self.watermark_order:
+            if self.watermark_type_vars.get(wt) and self.watermark_type_vars[wt].get():
+                self.watermark_selected_listbox.insert(tk.END, WATERMARK_TYPE_LABELS.get(wt, wt))
+
+    def on_watermark_type_toggle(self):
+        self.refresh_watermark_type_list()
+
     def on_subfolder_select(self, event):
         sel = event.widget.curselection()
         if not sel:
@@ -449,7 +656,70 @@ class WatermarkApp:
         path = self.output_var.get()
         if os.path.exists(path):
             os.startfile(path) if os.name == 'nt' else os.system(f'open "{path}"')
-    
+
+    def open_date_picker(self, variable, title="选择日期"):
+        def select_day(day):
+            try:
+                y = int(year_var.get())
+                m = int(month_var.get())
+                variable.set(f"{y}-{m:02d}-{day:02d}")
+            except Exception:
+                pass
+            picker.destroy()
+
+        def refresh_calendar(*_):
+            for child in days_frame.winfo_children():
+                child.destroy()
+            try:
+                y = int(year_var.get())
+                m = int(month_var.get())
+            except Exception:
+                y, m = now.year, now.month
+                year_var.set(y)
+                month_var.set(m)
+            month_days = calendar.monthcalendar(y, m)
+            for row_idx, week in enumerate(month_days):
+                for col_idx, day in enumerate(week):
+                    if day == 0:
+                        ttk.Label(days_frame, text='   ').grid(row=row_idx, column=col_idx, padx=1, pady=1)
+                    else:
+                        btn = ttk.Button(days_frame, text=f"{day:2d}", width=3,
+                                         command=lambda d=day: select_day(d))
+                        btn.grid(row=row_idx, column=col_idx, padx=1, pady=1)
+
+        picker = tk.Toplevel(self.root)
+        picker.title(title)
+        picker.resizable(False, False)
+        picker.transient(self.root)
+        picker.grab_set()
+
+        now = datetime.now()
+        selected_date = None
+        try:
+            selected_date = datetime.strptime(variable.get(), "%Y-%m-%d")
+        except Exception:
+            selected_date = now
+
+        year_var = tk.IntVar(value=selected_date.year)
+        month_var = tk.IntVar(value=selected_date.month)
+
+        ctrl_frame = ttk.Frame(picker)
+        ctrl_frame.pack(padx=10, pady=(10, 4), fill='x')
+        years = [str(y) for y in range(now.year - 60, now.year + 6)]
+        months = [str(m) for m in range(1, 13)]
+        ttk.Label(ctrl_frame, text='年').grid(row=0, column=0, sticky='w')
+        ttk.Combobox(ctrl_frame, textvariable=year_var, values=years, width=6, state='readonly').grid(row=0, column=1, padx=(4, 12))
+        ttk.Label(ctrl_frame, text='月').grid(row=0, column=2, sticky='w')
+        ttk.Combobox(ctrl_frame, textvariable=month_var, values=months, width=4, state='readonly').grid(row=0, column=3, padx=(4, 12))
+        ttk.Button(ctrl_frame, text='刷新', command=refresh_calendar).grid(row=0, column=4)
+
+        days_frame = ttk.Frame(picker)
+        days_frame.pack(padx=10, pady=(0, 10))
+
+        refresh_calendar()
+
+        ttk.Button(picker, text='取消', command=picker.destroy).pack(pady=(0, 10))
+
     def start_process(self):
         input_path = self.input_var.get()
         output_path = self.output_var.get()
@@ -476,6 +746,10 @@ class WatermarkApp:
             'save_mode': self.save_mode_var.get(),
             'color': self.color,
             'font_path': None,
+            'watermark_types': self.get_selected_watermark_types(),
+            'default_location': self.default_location_var.get(),
+            'due_date': self.due_date_var.get(),
+            'birth_date': self.birth_date_var.get(),
         }
         
         thread = threading.Thread(target=self.process, args=(input_path, output_path, config))
@@ -549,80 +823,68 @@ class WatermarkApp:
                 'save_mode': self.save_mode_var.get(),
                 'color': self.color,
                 'font_path': None,
+                'watermark_types': self.get_selected_watermark_types(),
+                'default_location': self.default_location_var.get(),
+                'due_date': self.due_date_var.get(),
+                'birth_date': self.birth_date_var.get(),
             }
 
             img = sample.convert('RGBA')
             width, height = img.size
 
-            date_taken = get_date_taken(self.preview_image_path)
-            if date_taken:
-                date_str = date_taken.strftime(config['date_format'])
-            else:
-                date_str = datetime.fromtimestamp(os.path.getmtime(self.preview_image_path)).strftime(config['date_format'])
-
             font_size = max(10, int(height * (config['font_scale'] / 100)))
             font = load_font(font_size, config.get('font_path'), italic=config.get('italic'))
 
-            text_layer = Image.new('RGBA', (1, 1), (0, 0, 0, 0))
-            text_draw = ImageDraw.Draw(text_layer)
-            bbox = text_draw.textbbox((0, 0), date_str, font=font)
-            text_width = bbox[2] - bbox[0]
-            text_height = bbox[3] - bbox[1]
-            italic_extra = int(abs(0.15) * text_height) if config.get('italic') else 0
-            padding = 4
-
-            margin = max(4, int(font_size * 0.6))
-            max_text_width = width - 2 * margin
-            while text_width + italic_extra + padding * 2 > max_text_width and font_size > 10:
-                font_size -= 1
-                font = load_font(font_size, config.get('font_path'), italic=config.get('italic'))
-                text_layer = Image.new('RGBA', (1, 1), (0, 0, 0, 0))
-                text_draw = ImageDraw.Draw(text_layer)
-                bbox = text_draw.textbbox((0, 0), date_str, font=font)
-                text_width = bbox[2] - bbox[0]
-                text_height = bbox[3] - bbox[1]
-                italic_extra = int(abs(0.15) * text_height) if config.get('italic') else 0
-
-            r, g, b = config['color']
-            opacity = int(config['opacity'])
-            alpha = int(255 * (opacity / 100))
-            padding = max(6, int(font_size * 0.25))
-            text_layer = build_text_layer(
-                date_str,
-                font,
-                (r, g, b),
-                alpha,
-                outline=config.get('outline'),
-                italic=config.get('italic'),
-                padding=padding,
-            )
-            layer_w, layer_h = text_layer.size
-            pos = config['position']
-            if pos == "右下":
-                x = width - layer_w - margin
-                y = height - layer_h - margin
-            elif pos == "左下":
-                x = margin
-                y = height - layer_h - margin
-            elif pos == "右上":
-                x = width - layer_w - margin
-                y = margin
-            elif pos == "左上":
-                x = margin
-                y = margin
-            elif pos == "底部居中":
-                x = (width - layer_w) // 2
-                y = height - layer_h - margin
+            lines = build_watermark_lines(self.preview_image_path, config, preview=True)
+            if not lines:
+                preview_img = img.copy().convert('RGB')
             else:
-                x = (width - layer_w) // 2
-                y = (height - layer_h) // 2
+                if config['position'] in ['右下', '右上']:
+                    align = 'right'
+                elif config['position'] == '底部居中':
+                    align = 'center'
+                else:
+                    align = 'left'
 
-            x = max(margin, min(x, width - layer_w - margin))
-            y = max(margin, min(y, height - layer_h - margin))
+                text_layer = build_text_layer(
+                    "\n".join(lines),
+                    font,
+                    config['color'],
+                    int(255 * (config['opacity'] / 100)),
+                    outline=config.get('outline'),
+                    italic=config.get('italic'),
+                    padding=max(6, int(font_size * 0.25)),
+                    align=align,
+                )
+                layer_w, layer_h = text_layer.size
 
-            preview_img = img.copy()
-            preview_img.paste(text_layer, (x, y), text_layer)
-            preview_img = preview_img.convert('RGB')
+                margin = max(4, int(font_size * 0.6))
+                pos = config['position']
+                if pos == "右下":
+                    x = width - layer_w - margin
+                    y = height - layer_h - margin
+                elif pos == "左下":
+                    x = margin
+                    y = height - layer_h - margin
+                elif pos == "右上":
+                    x = width - layer_w - margin
+                    y = margin
+                elif pos == "左上":
+                    x = margin
+                    y = margin
+                elif pos == "底部居中":
+                    x = (width - layer_w) // 2
+                    y = height - layer_h - margin
+                else:
+                    x = (width - layer_w) // 2
+                    y = (height - layer_h) // 2
+
+                x = max(margin, min(x, width - layer_w - margin))
+                y = max(margin, min(y, height - layer_h - margin))
+
+                preview_img = img.copy()
+                preview_img.paste(text_layer, (x, y), text_layer)
+                preview_img = preview_img.convert('RGB')
 
             # 根据预览窗口大小调整显示，但不放大超出原始图片尺寸
             if self.preview_window and self.preview_window.winfo_exists() and self.preview_label:
