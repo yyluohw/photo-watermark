@@ -46,66 +46,67 @@ def add_watermark(input_path, output_path, config):
     font = load_font(font_size, config.get('font_path'), italic=config.get('italic'))
 
     # 计算文字尺寸并确保文字宽度不超出图片范围
-    text_layer = Image.new('RGBA', img.size, (0, 0, 0, 0))
+    text_layer = Image.new('RGBA', (1, 1), (0, 0, 0, 0))
     text_draw = ImageDraw.Draw(text_layer)
     bbox = text_draw.textbbox((0, 0), date_str, font=font)
     text_width = bbox[2] - bbox[0]
     text_height = bbox[3] - bbox[1]
 
-    # 边距基于字体大小
+    italic_extra = int(abs(0.15) * text_height) if config.get('italic') else 0
+    padding = 4
+
     margin = max(4, int(font_size * 0.6))
-    # 若文字过宽，逐步减小字体直至适配或达到最小字号
     max_text_width = width - 2 * margin
-    while text_width > max_text_width and font_size > 10:
+    while text_width + italic_extra + padding * 2 > max_text_width and font_size > 10:
         font_size -= 1
         font = load_font(font_size, config.get('font_path'), italic=config.get('italic'))
-        text_layer = Image.new('RGBA', img.size, (0, 0, 0, 0))
+        text_layer = Image.new('RGBA', (1, 1), (0, 0, 0, 0))
         text_draw = ImageDraw.Draw(text_layer)
         bbox = text_draw.textbbox((0, 0), date_str, font=font)
         text_width = bbox[2] - bbox[0]
         text_height = bbox[3] - bbox[1]
-        margin = max(4, int(font_size * 0.6))
-    pos = config['position']
-    if pos == "右下":
-        x, y = width - text_width - margin, height - text_height - margin
-    elif pos == "左下":
-        x, y = margin, height - text_height - margin
-    elif pos == "右上":
-        x, y = width - text_width - margin, margin
-    elif pos == "左上":
-        x, y = margin, margin
-    elif pos == "底部居中":
-        x, y = (width - text_width) // 2, height - text_height - margin
-    else:
-        x, y = (width - text_width) // 2, (height - text_height) // 2
+        italic_extra = int(abs(0.15) * text_height) if config.get('italic') else 0
 
-    # 限制文本坐标不要超出图片范围
-    x = max(margin, min(x, max(margin, width - text_width - margin)))
-    y = max(margin, min(y, max(margin, height - text_height - margin)))
-
-    # 水印颜色 & 透明度（整数）
     r, g, b = config['color']
     opacity = int(config['opacity'])
     alpha = int(255 * (opacity / 100))
+    padding = max(6, int(font_size * 0.25))
+    text_layer = build_text_layer(
+        date_str,
+        font,
+        (r, g, b),
+        alpha,
+        outline=config.get('outline'),
+        italic=config.get('italic'),
+        padding=padding,
+    )
+    layer_w, layer_h = text_layer.size
+    pos = config['position']
+    if pos == "右下":
+        x = width - layer_w - margin
+        y = height - layer_h - margin
+    elif pos == "左下":
+        x = margin
+        y = height - layer_h - margin
+    elif pos == "右上":
+        x = width - layer_w - margin
+        y = margin
+    elif pos == "左上":
+        x = margin
+        y = margin
+    elif pos == "底部居中":
+        x = (width - layer_w) // 2
+        y = height - layer_h - margin
+    else:
+        x = (width - layer_w) // 2
+        y = (height - layer_h) // 2
 
-    # 描边与主文字都画在 text_layer 上
-    if config.get('outline'):
-        outline_color = (0, 0, 0, alpha)
-        for dx, dy in [(-1,-1),(-1,0),(-1,1),(0,-1),(0,1),(1,-1),(1,0),(1,1)]:
-            text_draw.text((x+dx, y+dy), date_str, font=font, fill=outline_color)
-
-    text_draw.text((x, y), date_str, fill=(r, g, b, alpha), font=font)
-
-    # 斜体：对 text_layer 做轻微的斜切以模拟斜体效果
-    if config.get('italic'):
-        try:
-            text_layer = apply_italic_shear(text_layer)
-        except Exception:
-            pass
+    x = max(margin, min(x, width - layer_w - margin))
+    y = max(margin, min(y, height - layer_h - margin))
 
     if img.mode != 'RGBA':
         img = img.convert('RGBA')
-    img = Image.alpha_composite(img, text_layer)
+    img.paste(text_layer, (x, y), text_layer)
 
     # 保存时尽量保留原始格式
     ext = os.path.splitext(input_path)[1].lower()
@@ -135,7 +136,7 @@ def add_watermark(input_path, output_path, config):
     return True
 
 def load_font(size, custom_path=None, italic=False):
-    """加载字体，优先使用真正的斜体字形；若没有可用斜体字体，则退回到轻微仿真效果。"""
+    """加载字体，优先使用常规字体；斜体由后续仿真处理，不强制替换字形。"""
     font_paths = []
 
     if custom_path and os.path.exists(custom_path):
@@ -151,62 +152,23 @@ def load_font(size, custom_path=None, italic=False):
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
     ])
 
-    def try_load(path, index=None):
+    def try_load(path):
         try:
-            return ImageFont.truetype(path, size, index=index) if index is not None else ImageFont.truetype(path, size)
+            return ImageFont.truetype(path, size)
         except Exception:
             return None
 
-    def try_candidates(paths):
-        for path in paths:
-            if italic:
-                for idx in (1, 2, 3):
-                    f = try_load(path, index=idx)
-                    if f:
-                        return f
-            f = try_load(path)
-            if f:
-                return f
-        return None
-
-    if italic:
-        if custom_path and os.path.exists(custom_path):
-            d = os.path.dirname(custom_path)
-            try:
-                for fname in os.listdir(d):
-                    if 'italic' in fname.lower() or 'oblique' in fname.lower() or 'slanted' in fname.lower():
-                        found = try_candidates([os.path.join(d, fname)])
-                        if found:
-                            return found
-            except Exception:
-                pass
-
-        for path in font_paths:
-            base, ext = os.path.splitext(path)
-            for cand in (base + ' Italic' + ext, base + '-Italic' + ext, base + 'Italic' + ext):
-                if os.path.exists(cand):
-                    f = try_candidates([cand])
-                    if f:
-                        return f
-            d = os.path.dirname(path)
-            try:
-                for fname in os.listdir(d):
-                    if 'italic' in fname.lower() or 'oblique' in fname.lower() or 'slanted' in fname.lower():
-                        found = try_candidates([os.path.join(d, fname)])
-                        if found:
-                            return found
-            except Exception:
-                continue
-
-    font = try_candidates(font_paths)
-    if font:
-        return font
+    for path in font_paths:
+        if os.path.exists(path):
+            font = try_load(path)
+            if font:
+                return font
 
     return ImageFont.load_default()
 
 
 def apply_italic_shear(layer, shear=0.15):
-    """仅在找不到真实斜体字形时使用的轻微仿真效果，不再做反向平移补偿。"""
+    """仅在找不到真实斜体字形时使用的轻微仿真效果，保持完整斜切后宽度。"""
     try:
         width, height = layer.size
         offset = max(2, int(abs(shear) * height * 1.2))
@@ -219,9 +181,41 @@ def apply_italic_shear(layer, shear=0.15):
         )
         canvas = Image.new('RGBA', (width + offset, height), (0, 0, 0, 0))
         canvas.paste(transformed, (0, 0), transformed)
-        return canvas.crop((0, 0, width, height))
+        return canvas
     except Exception:
         return layer
+
+
+def build_text_layer(text, font, color, alpha, outline=False, italic=False, padding=8):
+    """生成可完整包容文字与描边的 RGBA 文本图层，避免字体基线偏移导致裁剪。"""
+    temp = Image.new('RGBA', (1, 1), (0, 0, 0, 0))
+    temp_draw = ImageDraw.Draw(temp)
+    bbox = temp_draw.textbbox((0, 0), text, font=font)
+    text_width = bbox[2] - bbox[0]
+    text_height = bbox[3] - bbox[1]
+    italic_extra = int(abs(0.15) * text_height) if italic else 0
+
+    layer_w = text_width + italic_extra + padding * 2
+    layer_h = text_height + padding * 2
+    text_layer = Image.new('RGBA', (layer_w, layer_h), (0, 0, 0, 0))
+    text_draw = ImageDraw.Draw(text_layer)
+
+    draw_x = padding - min(0, bbox[0])
+    draw_y = padding - min(0, bbox[1])
+    if outline:
+        outline_color = (0, 0, 0, alpha)
+        for dx, dy in [(-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1)]:
+            text_draw.text((draw_x + dx, draw_y + dy), text, font=font, fill=outline_color)
+
+    text_draw.text((draw_x, draw_y), text, fill=(color[0], color[1], color[2], alpha), font=font)
+
+    if italic:
+        try:
+            text_layer = apply_italic_shear(text_layer)
+        except Exception:
+            pass
+
+    return text_layer
 
 # ============ GUI 界面 ============
 
@@ -229,8 +223,8 @@ class WatermarkApp:
     def __init__(self, root):
         self.root = root
         self.root.title("📷 照片日期水印工具")
-        self.root.geometry("700x640")
-        self.root.minsize(640, 480)
+        self.root.geometry("700x760")
+        self.root.minsize(700, 720)
         self.root.resizable(True, True)
         
         # 配置变量
@@ -569,58 +563,66 @@ class WatermarkApp:
             font_size = max(10, int(height * (config['font_scale'] / 100)))
             font = load_font(font_size, config.get('font_path'), italic=config.get('italic'))
 
-            text_layer = Image.new('RGBA', img.size, (0, 0, 0, 0))
+            text_layer = Image.new('RGBA', (1, 1), (0, 0, 0, 0))
             text_draw = ImageDraw.Draw(text_layer)
             bbox = text_draw.textbbox((0, 0), date_str, font=font)
             text_width = bbox[2] - bbox[0]
             text_height = bbox[3] - bbox[1]
+            italic_extra = int(abs(0.15) * text_height) if config.get('italic') else 0
+            padding = 4
+
             margin = max(4, int(font_size * 0.6))
             max_text_width = width - 2 * margin
-            while text_width > max_text_width and font_size > 10:
+            while text_width + italic_extra + padding * 2 > max_text_width and font_size > 10:
                 font_size -= 1
                 font = load_font(font_size, config.get('font_path'), italic=config.get('italic'))
-                text_layer = Image.new('RGBA', img.size, (0, 0, 0, 0))
+                text_layer = Image.new('RGBA', (1, 1), (0, 0, 0, 0))
                 text_draw = ImageDraw.Draw(text_layer)
                 bbox = text_draw.textbbox((0, 0), date_str, font=font)
                 text_width = bbox[2] - bbox[0]
                 text_height = bbox[3] - bbox[1]
-                margin = max(4, int(font_size * 0.6))
-
-            pos = config['position']
-            if pos == "右下":
-                x, y = width - text_width - margin, height - text_height - margin
-            elif pos == "左下":
-                x, y = margin, height - text_height - margin
-            elif pos == "右上":
-                x, y = width - text_width - margin, margin
-            elif pos == "左上":
-                x, y = margin, margin
-            elif pos == "底部居中":
-                x, y = (width - text_width) // 2, height - text_height - margin
-            else:
-                x, y = (width - text_width) // 2, (height - text_height) // 2
-
-            x = max(margin, min(x, max(margin, width - text_width - margin)))
-            y = max(margin, min(y, max(margin, height - text_height - margin)))
+                italic_extra = int(abs(0.15) * text_height) if config.get('italic') else 0
 
             r, g, b = config['color']
             opacity = int(config['opacity'])
             alpha = int(255 * (opacity / 100))
+            padding = max(6, int(font_size * 0.25))
+            text_layer = build_text_layer(
+                date_str,
+                font,
+                (r, g, b),
+                alpha,
+                outline=config.get('outline'),
+                italic=config.get('italic'),
+                padding=padding,
+            )
+            layer_w, layer_h = text_layer.size
+            pos = config['position']
+            if pos == "右下":
+                x = width - layer_w - margin
+                y = height - layer_h - margin
+            elif pos == "左下":
+                x = margin
+                y = height - layer_h - margin
+            elif pos == "右上":
+                x = width - layer_w - margin
+                y = margin
+            elif pos == "左上":
+                x = margin
+                y = margin
+            elif pos == "底部居中":
+                x = (width - layer_w) // 2
+                y = height - layer_h - margin
+            else:
+                x = (width - layer_w) // 2
+                y = (height - layer_h) // 2
 
-            if config.get('outline'):
-                outline_color = (0, 0, 0, alpha)
-                for dx, dy in [(-1,-1),(-1,0),(-1,1),(0,-1),(0,1),(1,-1),(1,0),(1,1)]:
-                    text_draw.text((x+dx, y+dy), date_str, font=font, fill=outline_color)
+            x = max(margin, min(x, width - layer_w - margin))
+            y = max(margin, min(y, height - layer_h - margin))
 
-            text_draw.text((x, y), date_str, fill=(r, g, b, alpha), font=font)
-
-            if config.get('italic'):
-                try:
-                    text_layer = apply_italic_shear(text_layer)
-                except Exception:
-                    pass
-
-            preview_img = Image.alpha_composite(img, text_layer).convert('RGB')
+            preview_img = img.copy()
+            preview_img.paste(text_layer, (x, y), text_layer)
+            preview_img = preview_img.convert('RGB')
 
             # 根据预览窗口大小调整显示，但不放大超出原始图片尺寸
             if self.preview_window and self.preview_window.winfo_exists() and self.preview_label:
